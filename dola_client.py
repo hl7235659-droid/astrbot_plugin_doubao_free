@@ -860,11 +860,18 @@ class CreditError(Exception):
 # ============ 多账号轮询 ============
 
 class DolaPool:
-    """多 cookie 轮询池：shuffle + 失败换号 + 额度检测"""
+    """多 cookie 轮询池：支持国际版+国内版混合，shuffle + 失败换号 + 额度检测"""
 
     def __init__(self, cookies: list, api_base: str = "https://www.dola.com",
                  video_timeout: int = 300, image_timeout: int = 120, max_retry: int = 2):
-        self.clients = [DolaClient(c, api_base) for c in cookies if parse_cookie(c)["sessionid"]]
+        self.clients = []
+        for c in cookies:
+            try:
+                client = create_client(c, api_base)
+                if client.is_valid:
+                    self.clients.append(client)
+            except Exception:
+                pass
         self.video_timeout = video_timeout
         self.image_timeout = image_timeout
         self.max_retry = max_retry
@@ -924,3 +931,386 @@ class DolaPool:
             "generate_video", prompt, ratio, duration,
             timeout=self.video_timeout
         )
+
+
+# ============ 国内版 (doubao.com) ============
+
+CN_DOMAIN = "www.doubao.com"
+CN_DEFAULT_ASSISTANT_ID = "497858"
+CN_PC_VERSION = "2.44.0"
+
+CN_FAKE_HEADERS = {
+    "Accept": "*/*",
+    "Accept-Encoding": "gzip, deflate",
+    "Accept-Language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Last-event-id": "undefined",
+    "Origin": "https://www.doubao.com",
+    "Pragma": "no-cache",
+    "Priority": "u=1, i",
+    "Referer": "https://www.doubao.com",
+    "Sec-Ch-Ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+}
+
+
+def _fake_ms_token() -> str:
+    """生成伪 msToken（国内版不校验）"""
+    import base64
+    import os
+    return base64.urlsafe_b64encode(os.urandom(96)).rstrip(b"=").decode()
+
+
+def _fake_a_bogus() -> str:
+    """生成伪 a_bogus（国内版居然接受这个格式）"""
+    import random
+    import string
+    part1 = "".join(random.choices(string.ascii_letters + string.digits, k=34))
+    part2 = "".join(random.choices(string.ascii_letters + string.digits, k=6))
+    return f"mf-{part1}-{part2}"
+
+
+def _random_numeric(length: int) -> str:
+    import random
+    return "".join(random.choices("0123456789", k=length))
+
+
+class DoubaoCNClient:
+    """豆包国内版 (doubao.com) API 客户端
+    token 即 sessionid（32位十六进制），cookie = sessionid=xxx; sessionid_ss=xxx
+    支持聊天、图片识别、文生图。不支持视频（卡 a_bogus 真签名）。
+    """
+
+    def __init__(self, token: str):
+        self.token = token  # sessionid
+        self.cookie = f"sessionid={token}; sessionid_ss={token}"
+        self.device_id = "7" + _random_numeric(18)
+        self.web_id = "7" + _random_numeric(18)
+
+    @property
+    def is_valid(self) -> bool:
+        return bool(self.token) and len(self.token) >= 20
+
+    @staticmethod
+    def _extract_cn_text(events: list) -> str:
+        """从国内版 SSE 事件列表提取文本（event_type 2001=文本/2003=结束/2005=错误）"""
+        full_text = ""
+        for event_name, data in events:
+            event_type = data.get("event_type")
+            event_data_str = data.get("event_data", "")
+            if event_type == 2005:
+                try:
+                    err = json.loads(event_data_str)
+                    raise Exception(f"国内版错误: {err.get('code')} {err.get('message', '')[:60]}")
+                except json.JSONDecodeError:
+                    pass
+                continue
+            if event_type == 2003:
+                continue
+            if event_type != 2001:
+                continue
+            try:
+                result = json.loads(event_data_str)
+            except json.JSONDecodeError:
+                continue
+            message = result.get("message", "")
+            text = ""
+            if isinstance(message, str):
+                text = message
+            elif isinstance(message, dict):
+                if isinstance(message.get("text"), str):
+                    text = message["text"]
+                elif isinstance(message.get("delta"), dict) and isinstance(message["delta"].get("text"), str):
+                    text = message["delta"]["text"]
+            if text:
+                full_text += text
+        return full_text
+
+    def _build_params(self, extra: dict = None) -> dict:
+        params = {
+            "aid": CN_DEFAULT_ASSISTANT_ID,
+            "device_id": self.device_id,
+            "device_platform": "web",
+            "language": "zh",
+            "pc_version": CN_PC_VERSION,
+            "pkg_type": "release_version",
+            "real_aid": CN_DEFAULT_ASSISTANT_ID,
+            "region": "CN",
+            "samantha_web": 1,
+            "sys_region": "CN",
+            "tea_uuid": self.web_id,
+            "use-olympus-account": 1,
+            "version_code": VERSION_CODE,
+            "web_id": self.web_id,
+            "web_tab_id": str(uuid_lib.uuid4()),
+        }
+        if extra:
+            params.update(extra)
+        return params
+
+    def _build_headers(self, referer: str = None) -> dict:
+        """构建国内版请求头（含 X-Flow-Trace，防风控）"""
+        u = str(uuid_lib.uuid4())
+        return {
+            **CN_FAKE_HEADERS,
+            "Cookie": self.cookie,
+            "X-Flow-Trace": f"04-{u}-{u[:16]}-01",
+            "Referer": referer or f"https://{CN_DOMAIN}/chat/",
+        }
+
+    def _messages_to_text(self, messages: list) -> str:
+        """将多轮对话合并为 <|im_start|> 格式字符串（国内版 messagesPrepare 逻辑）"""
+        if len(messages) < 2:
+            # 单条消息直接透传
+            parts = []
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, list):
+                    content = "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
+                parts.append(content)
+            return "\n".join(parts)
+
+        result = ""
+        for msg in messages:
+            role = msg.get("role", "user")
+            role_tag = {"system": "<|im_start|>system", "assistant": "<|im_start|>assistant", "user": "<|im_start|>user"}.get(role, "<|im_start|>user")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                text_parts = [p.get("text", "") for p in content if p.get("type") == "text"]
+                content = "\n".join(text_parts)
+            result += f"{role_tag}\n{content}\n<|im_end|>\n"
+        return result
+
+    async def chat(self, messages: list, deep_think: bool = False) -> str:
+        """国内版聊天"""
+        body = {
+            "messages": [{
+                "content": json.dumps({"text": self._messages_to_text(messages)}),
+                "content_type": 2001,
+                "attachments": [],
+                "references": [],
+            }],
+            "completion_option": {
+                "is_regen": False,
+                "with_suggest": True,
+                "need_create_conversation": True,
+                "launch_stage": 1,
+                "is_replace": False,
+                "is_delete": False,
+                "message_from": 0,
+                "action_bar_skill_id": 0,
+                "use_deep_think": deep_think,
+                "use_auto_cot": False,
+                "resend_for_regen": False,
+                "enable_commerce_credit": False,
+                "event_id": "0",
+            },
+            "evaluate_option": {"web_ab_params": ""},
+            "section_id": "26" + _random_numeric(16),
+            "conversation_id": "0",
+            "local_conversation_id": "local_16" + _random_numeric(14),
+            "local_message_id": str(uuid_lib.uuid4()),
+        }
+        url = f"https://{CN_DOMAIN}/samantha/chat/completion"
+        headers = {**self._build_headers(), "agw-js-conv": "str, str"}
+        params = self._build_params({"msToken": _fake_ms_token(), "a_bogus": _fake_a_bogus()})
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params, json=body, headers=headers,
+                                     timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                events = await self._read_sse(resp)
+        return self._extract_cn_text(events)
+
+    async def _read_sse(self, resp: aiohttp.ClientResponse) -> list:
+        """读取 SSE 流"""
+        events = []
+        buffer = ""
+        async for chunk in resp.content:
+            buffer += chunk.decode("utf-8", errors="replace")
+            while "\n\n" in buffer:
+                raw_event, buffer = buffer.split("\n\n", 1)
+                event_name = ""
+                data_lines = []
+                for line in raw_event.split("\n"):
+                    if line.startswith("event:"):
+                        event_name = line[6:].strip()
+                    elif line.startswith("data:"):
+                        data_lines.append(line[5:].strip())
+                data_str = "\n".join(data_lines)
+                try:
+                    data = json.loads(data_str) if data_str else {}
+                except json.JSONDecodeError:
+                    data = {"_raw": data_str}
+                events.append((event_name, data))
+        return events
+
+    async def upload_image(self, image_input: str) -> str:
+        """国内版图片上传：prepare_upload(scene_id=5) → ApplyImageUpload → PUT TOS"""
+        if image_input.startswith("tos-cn-i-"):
+            return image_input
+        image_buf = await self._fetch_image(image_input)
+
+        # 1. prepare_upload（国内版 scene_id="5"）
+        url = f"https://{CN_DOMAIN}/alice/resource/prepare_upload"
+        headers = {**self._build_headers(), "agw-js-conv": "str"}
+        params = self._build_params({"msToken": _fake_ms_token(), "a_bogus": _fake_a_bogus()})
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params,
+                                     json={"tenant_id": "5", "scene_id": "5", "resource_type": 2},
+                                     headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as p1:
+                p1_data = await p1.json(content_type=None)
+        # 响应结构: {code:0, data:{service_id, upload_host, upload_auth_token:{...}}}
+        upload_data = p1_data.get("data") or p1_data
+        if not upload_data.get("upload_auth_token"):
+            raise Exception(f"国内版 prepare_upload 失败: {json.dumps(p1_data)[:100]}")
+
+        auth = upload_data["upload_auth_token"]
+        service_id = upload_data["service_id"]
+        upload_host = upload_data["upload_host"]
+        ak, sk, sts = auth["access_key"], auth["secret_key"], auth["session_token"]
+
+        # 2. ApplyImageUpload
+        apply_url = (
+            f"https://{upload_host}/?Action=ApplyImageUpload&Version=2018-08-01"
+            f"&ServiceId={service_id}&NeedFallback=true&UploadNum=1"
+            f"&FileSize={len(image_buf)}&FileExtension=.png"
+        )
+        sig = aws4_sign("GET", apply_url, ak, sk, sts)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(apply_url, headers=sig, timeout=aiohttp.ClientTimeout(total=15)) as p2:
+                p2_data = await p2.json(content_type=None)
+        store_info = p2_data["Result"]["UploadAddress"]["StoreInfos"][0]
+        store_uri = store_info["StoreUri"]
+        tos_host = p2_data["Result"]["UploadAddress"]["UploadHosts"][0]
+
+        # 3. PUT TOS
+        crc = crc32_hex(image_buf)
+        tos_url = f"https://{tos_host}/{store_uri}"
+        tos_headers = {
+            "Authorization": store_info["Auth"],
+            "Content-Type": "application/octet-stream",
+            "content-crc32": crc,
+            "Content-Disposition": 'attachment; filename="image.png"',
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.put(tos_url, data=image_buf, headers=tos_headers,
+                                   timeout=aiohttp.ClientTimeout(total=30)) as p3:
+                await p3.read()
+        return store_uri
+
+    async def _fetch_image(self, image_input: str) -> bytes:
+        if image_input.startswith("http"):
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_input, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    return await r.read()
+        import base64
+        b64 = re.sub(r"^data:[^;]+;base64,", "", image_input)
+        return base64.b64decode(b64)
+
+    async def vision(self, image_input: str, prompt: str) -> str:
+        """国内版图片识别：上传图片 → vlm_image attachment → 聊天"""
+        image_uri = await self.upload_image(image_input)
+        body = {
+            "messages": [{
+                "content": json.dumps({"text": prompt}),
+                "content_type": 2001,
+                "attachments": [{
+                    "type": "vlm_image",
+                    "id": str(uuid_lib.uuid4()),
+                    "name": "image.png",
+                    "key": image_uri,
+                    "url": image_uri,
+                }],
+                "references": [],
+            }],
+            "completion_option": {
+                "is_regen": False, "with_suggest": True, "need_create_conversation": True,
+                "launch_stage": 1, "is_replace": False, "is_delete": False,
+                "message_from": 0, "action_bar_skill_id": 0, "use_deep_think": False,
+                "use_auto_cot": False, "resend_for_regen": False,
+                "enable_commerce_credit": False, "event_id": "0",
+            },
+            "evaluate_option": {"web_ab_params": ""},
+            "section_id": "26" + _random_numeric(16),
+            "conversation_id": "0",
+            "local_conversation_id": "local_16" + _random_numeric(14),
+            "local_message_id": str(uuid_lib.uuid4()),
+        }
+        url = f"https://{CN_DOMAIN}/samantha/chat/completion"
+        headers = {**self._build_headers(), "agw-js-conv": "str, str"}
+        params = self._build_params({"msToken": _fake_ms_token(), "a_bogus": _fake_a_bogus()})
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params, json=body, headers=headers,
+                                     timeout=aiohttp.ClientTimeout(total=120)) as resp:
+                events = await self._read_sse(resp)
+        return self._extract_cn_text(events)
+
+    async def generate_image(self, prompt: str, ratio: str = "1:1", style: str = "auto") -> str:
+        """国内版文生图（和国际版结构类似，用 ability_type=16）"""
+        # 国内版文生图也是 /samantha/chat/completion，请求体加 chat_ability
+        body = {
+            "messages": [{
+                "content": json.dumps({"text": f"帮我生成图片：{prompt}\n风格：{style}\n比例：{ratio}"}),
+                "content_type": 2001,
+                "attachments": [],
+                "references": [],
+            }],
+            "completion_option": {
+                "is_regen": False, "with_suggest": True, "need_create_conversation": True,
+                "launch_stage": 1, "is_replace": False, "is_delete": False,
+                "message_from": 0, "action_bar_skill_id": 0, "use_deep_think": False,
+                "use_auto_cot": False, "resend_for_regen": False,
+                "enable_commerce_credit": False, "event_id": "0",
+            },
+            "evaluate_option": {"web_ab_params": ""},
+            "chat_ability": {"ability_type": 16, "ability_param": "{}"},
+            "section_id": "26" + _random_numeric(16),
+            "conversation_id": "0",
+            "local_conversation_id": "local_16" + _random_numeric(14),
+            "local_message_id": str(uuid_lib.uuid4()),
+        }
+        url = f"https://{CN_DOMAIN}/samantha/chat/completion"
+        headers = {**self._build_headers(), "agw-js-conv": "str, str"}
+        params = self._build_params({"msToken": _fake_ms_token(), "a_bogus": _fake_a_bogus()})
+        conv_id = ""
+        image_url = ""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params, json=body, headers=headers,
+                                     timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                events = await self._read_sse(resp)
+        for event_name, data in events:
+            if event_name == "SSE_ACK":
+                conv_id = (data.get("ack_client_meta") or {}).get("conversation_id", "")
+            raw = json.dumps(data)
+            urls = re.findall(r"https?://[^\"']*ibyteimg[^\"']*", raw)
+            if urls:
+                image_url = urls[0].replace("\\u0026", "&")
+        if image_url:
+            return image_url
+        raise Exception("国内版文生图未获取到图片URL")
+
+    async def generate_video(self, *args, **kwargs):
+        """国内版不支持视频生成（a_bogus 真签名无法绕过）"""
+        raise CreditError("国内版不支持视频生成（卡 a_bogus 签名）")
+
+
+# ============ 统一客户端工厂 ============
+
+def create_client(cookie_or_token: str, api_base: str = "https://www.dola.com") -> "DolaClient | DoubaoCNClient":
+    """根据 cookie 特征自动创建国际版或国内版客户端
+    - 含 msToken= → 国际版 DolaClient
+    - 纯 sessionid（32位十六进制）或不含 msToken 的 doubao cookie → 国内版 DoubaoCNClient
+    """
+    if "msToken=" in cookie_or_token:
+        return DolaClient(cookie_or_token, api_base)
+    else:
+        # 国内版：可能是纯 sessionid 或完整 doubao cookie
+        token = cookie_or_token
+        m = re.search(r"sessionid=([^;]+)", cookie_or_token)
+        if m:
+            token = m.group(1)
+        return DoubaoCNClient(token)

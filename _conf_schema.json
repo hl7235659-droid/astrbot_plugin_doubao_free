@@ -1,0 +1,33 @@
+{
+  "cookies": {
+    "description": "豆包国际版(dola.com) Cookie 列表，一行一个。登录 www.dola.com 后从浏览器 F12 复制完整 Cookie。多个 Cookie 会自动轮询。\n注意：需要 JP/KR 等地区出口 IP 才能使用 dola.com。",
+    "type": "list",
+    "hint": "从浏览器复制完整 Cookie 字符串，含 msToken=、s_v_web_id=、sessionid= 等字段",
+    "default": [],
+    "obvious_hint": true
+  },
+  "api_base": {
+    "description": "dola.com 域名（一般不用改）",
+    "type": "string",
+    "default": "https://www.dola.com",
+    "hint": "默认 https://www.dola.com"
+  },
+  "video_poll_timeout": {
+    "description": "视频生成轮询超时（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "视频生成通常 2-4 分钟，超时后换号或报错"
+  },
+  "image_poll_timeout": {
+    "description": "文生图轮询超时（秒）",
+    "type": "int",
+    "default": 120,
+    "hint": "文生图通常 10-30 秒"
+  },
+  "max_retry": {
+    "description": "单账号最大重试次数（额度不足不重试，直接换号）",
+    "type": "int",
+    "default": 2,
+    "hint": "非额度错误的重试次数"
+  }
+}

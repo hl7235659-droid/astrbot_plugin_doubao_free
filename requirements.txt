@@ -1,0 +1,1 @@
+# 本插件无额外依赖，aiohttp 已包含在 AstrBot 中

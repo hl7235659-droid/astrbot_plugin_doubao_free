@@ -1,0 +1,5 @@
+name: astrbot_plugin_doubao_free
+desc: 豆包(dola.com国际版)免费API插件。填入Cookie即可使用聊天、图片识别、文生图、视频生成。支持多账号轮询、额度不足自动换号。
+author: tebbit
+version: 1.0.0
+repo: https://github.com/hl7235659-droid/astrbot_plugin_doubao_free

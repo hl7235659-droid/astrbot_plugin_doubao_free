@@ -264,13 +264,15 @@ class Main(Star):
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=120)) as resp:
                     if resp.status != 200:
+                        logger.error(f"[doubao_free] 下载失败 HTTP {resp.status}: {url[:80]}")
                         return None
                     data = await resp.read()
                     with open(local_path, "wb") as f:
                         f.write(data)
+                    logger.info(f"[doubao_free] 下载成功: {local_path} ({len(data)} bytes)")
                     return str(local_path)
         except Exception as e:
-            logger.error(f"[doubao_free] 下载失败: {e}")
+            logger.error(f"[doubao_free] 下载异常: {e}")
             return None
 
     async def terminate(self):

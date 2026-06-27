@@ -116,6 +116,30 @@ def aws4_sign(method: str, url: str, ak: str, sk: str, sts: str) -> dict:
     }
 
 
+def _find_url_in_data(data, *keywords) -> str:
+    """递归遍历数据结构（dict/list/str），找包含所有关键词的 http URL。
+    比从 json.dumps 字符串正则提取更可靠（不会有转义残留）。"""
+    if isinstance(data, str):
+        if all(kw in data for kw in keywords) and data.startswith("http"):
+            return data
+        # 字符串里可能内嵌 URL（如 JSON 字符串值）
+        for m in re.finditer(r"https?://[^\s\"'\\]+", data):
+            url = m.group(0)
+            if all(kw in url for kw in keywords):
+                return url
+    elif isinstance(data, dict):
+        for v in data.values():
+            found = _find_url_in_data(v, *keywords)
+            if found:
+                return found
+    elif isinstance(data, list):
+        for item in data:
+            found = _find_url_in_data(item, *keywords)
+            if found:
+                return found
+    return ""
+
+
 def build_query_params(cookie: str, extra: dict = None) -> dict:
     """构建 dola API 通用 URL 参数"""
     info = parse_cookie(cookie)
@@ -600,11 +624,10 @@ class DolaClient:
         for event_name, data in events:
             if event_name == "SSE_ACK":
                 conv_id = (data.get("ack_client_meta") or {}).get("conversation_id", "")
-            # 从原始数据里搜 ibyteimg URL
-            raw = json.dumps(data)
-            urls = re.findall(r"https?://[^\"']*ibyteimg[^\"']*image_raw[^\"']*", raw)
-            if urls:
-                image_url = urls[0].replace("\\u0026", "&").replace("\\\\u0026", "&")
+            # 递归搜索数据结构里的 ibyteimg URL（比正则提 json.dumps 更可靠）
+            found = _find_url_in_data(data, "ibyteimg", "image_raw")
+            if found:
+                image_url = found
 
         if image_url:
             return image_url
@@ -691,11 +714,10 @@ class DolaClient:
                                     url = (img.get(key) or {}).get("url", "")
                                     if url:
                                         return url
-                                # 兜底搜 ibyteimg
-                                raw = json.dumps(cre)
-                                urls = re.findall(r"https?://[^\"']*ibyteimg[^\"']*", raw)
-                                if urls:
-                                    return urls[0].replace("\\u0026", "&")
+                                # 兜底递归搜 ibyteimg URL
+                                found = _find_url_in_data(cre, "ibyteimg")
+                                if found:
+                                    return found
                 except Exception:
                     pass
         raise Exception("文生图超时未出图")

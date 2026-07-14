@@ -6,7 +6,7 @@
 - 聊天（/chat/completion SSE 流式）
 - 图片识别（上传图片 + block_type:10052）
 - 文生图（ability_type:16）
-- 视频生成（生成影片前缀 + ability_type:17 + 轮询出片）
+- 视频生成（skill_type:17 + ability_type:50 + 轮询出片）
 - 多账号轮询（shuffle + 失败换号 + 额度检测）
 """
 
@@ -27,6 +27,8 @@ import aiohttp
 
 DOLA_AID = "495671"
 DOLA_BOT_ID = "7339470689562525703"
+DOLA_VIDEO_SKILL_TYPE = 17
+DOLA_VIDEO_ABILITY_TYPE = 50
 VERSION_CODE = "20800"
 
 FAKE_HEADERS = {
@@ -165,6 +167,20 @@ def build_query_params(cookie: str, extra: dict = None) -> dict:
     return params
 
 
+def build_video_chat_ability(ratio: str, duration: int) -> dict:
+    nested = {
+        "ability_type": DOLA_VIDEO_ABILITY_TYPE,
+        "ability_param": {
+            "ratio": ratio,
+            "duration": int(duration),
+        },
+    }
+    return {
+        "ability_type": DOLA_VIDEO_SKILL_TYPE,
+        "ability_param": json.dumps(nested, separators=(",", ":")),
+    }
+
+
 # ============ DolaClient ============
 
 class DolaClient:
@@ -267,6 +283,31 @@ class DolaClient:
                         if c.get("text_block", {}).get("text"):
                             text += c["text_block"]["text"]
         return text
+
+    @staticmethod
+    def _extract_video_conversation_id(events: list) -> str:
+        for event_name, event_data in events:
+            if event_name != "SSE_ACK" or not isinstance(event_data, dict):
+                continue
+            candidates = [event_data]
+            wrapped = event_data.get("data")
+            if isinstance(wrapped, dict):
+                candidates.append(wrapped)
+            for candidate in candidates:
+                ack_meta = candidate.get("ack_client_meta")
+                if isinstance(ack_meta, dict) and ack_meta.get("conversation_id"):
+                    return str(ack_meta["conversation_id"])
+                if candidate.get("conversation_id"):
+                    return str(candidate["conversation_id"])
+        return ""
+
+    @staticmethod
+    def _summarize_sse_events(events: list) -> str:
+        parts = []
+        for event_name, event_data in events[:12]:
+            keys = sorted(str(key) for key in event_data)[:12] if isinstance(event_data, dict) else []
+            parts.append(f"{event_name or '<unnamed>'}[{','.join(keys)}]")
+        return ";".join(parts)[:500] or "<none>"
 
     # ===== 聊天 =====
 
@@ -732,13 +773,10 @@ class DolaClient:
             async with resp:
                 events = await self._read_sse_stream(resp)
 
-        conv_id = ""
-        for event_name, data in events:
-            if event_name == "SSE_ACK":
-                conv_id = (data.get("ack_client_meta") or {}).get("conversation_id", "")
-
+        conv_id = self._extract_video_conversation_id(events)
         if not conv_id:
-            raise Exception("视频受理未返回 conversation_id")
+            summary = self._summarize_sse_events(events)
+            raise Exception(f"视频受理未返回 conversation_id; events={summary}")
 
         # 轮询出片
         return await self._poll_video(conv_id, timeout)
@@ -806,10 +844,7 @@ class DolaClient:
                 "recovery_option": {"is_recovery": False, "req_create_time_sec": now_sec, "append_sse_event_scene": 0},
                 "message_storage_type": 0,
             },
-            "chat_ability": {
-                "ability_type": 17,
-                "ability_param": json.dumps({"ratio": ratio, "model": "seedance_v2.0", "duration": duration}),
-            },
+            "chat_ability": build_video_chat_ability(ratio, duration),
             "user_context": [],
             "ext": {
                 "fp": self.info["fp"],
@@ -818,6 +853,13 @@ class DolaClient:
                 "collection_id": "",
                 "conversation_init_option": '{"need_ack_conversation":true}',
                 "commerce_credit_config_enable": "0",
+                "input_skill": json.dumps(
+                    {
+                        "skill_id": str(DOLA_VIDEO_SKILL_TYPE),
+                        "skill_type": DOLA_VIDEO_SKILL_TYPE,
+                    },
+                    separators=(",", ":"),
+                ),
             },
         }
 
